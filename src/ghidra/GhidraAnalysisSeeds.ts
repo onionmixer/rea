@@ -25,7 +25,12 @@ export const ghidraSeedCommitmentSchema = z.strictObject({
   path: z.string().refine(isAbsolute, "Seed path must be absolute"),
   configured_path: z.string().refine(isAbsolute, "Seed path must be absolute"),
   sha256: digest,
-  entries: z.strictObject({ function: count, code: count, label: count }),
+  entries: z.strictObject({
+    function: count,
+    code: count,
+    label: count,
+    fallthrough: count,
+  }),
 });
 export type GhidraSeedCommitment = z.infer<typeof ghidraSeedCommitmentSchema>;
 
@@ -41,16 +46,23 @@ export const ghidraSeedReportSchema = z.strictObject({
   code_failed: count,
   label_applied: count,
   label_failed: count,
+  fallthrough_applied: count,
+  fallthrough_failed: count,
   unmapped: count,
 });
 export type GhidraSeedReport = z.infer<typeof ghidraSeedReportSchema>;
 
-type SeedKind = "function" | "code" | "label";
+type SeedKind = "function" | "code" | "label" | "fallthrough";
 interface SeedEntry {
   readonly address: bigint;
   readonly kind: SeedKind;
   readonly name?: string;
+  /** Fallthrough seeds: the address where execution resumes after inline operands. */
+  readonly target?: bigint;
 }
+
+/** Largest inline operand span a fallthrough seed may skip after its instruction. */
+const MAX_FALLTHROUGH_SPAN = 64n;
 
 const seedLineError = (line: number, constraint: string) =>
   new ConfigurationError("Invalid REA environment configuration", {
@@ -65,6 +77,9 @@ const seedLineError = (line: number, constraint: string) =>
 /**
  * Parse `address<TAB>kind[<TAB>name]` lines. Blank lines and `#` comments are
  * ignored. Addresses are hexadecimal offsets in the default address space.
+ * A `fallthrough` seed takes a target address instead of a name: the
+ * instruction at `address` resumes at `target`, and the bytes between them are
+ * inline operands (for example a word that follows a 68000 `trap`).
  */
 export const parseGhidraSeeds = (
   text: string,
@@ -82,8 +97,46 @@ export const parseGhidraSeeds = (
     const [address, kind, name] = fields;
     if (address === undefined || !/^0x[0-9a-fA-F]{1,16}$/u.test(address))
       return err(seedLineError(number, "address must be 0x-prefixed hex"));
-    if (kind !== "function" && kind !== "code" && kind !== "label")
-      return err(seedLineError(number, "kind must be function, code or label"));
+    if (
+      kind !== "function" &&
+      kind !== "code" &&
+      kind !== "label" &&
+      kind !== "fallthrough"
+    )
+      return err(
+        seedLineError(number, "kind must be function, code, label or fallthrough"),
+      );
+    if (kind === "fallthrough") {
+      if (name === undefined || !/^0x[0-9a-fA-F]{1,16}$/u.test(name))
+        return err(
+          seedLineError(
+            number,
+            "a fallthrough seed requires a 0x-prefixed hex target address",
+          ),
+        );
+      const from = BigInt(address);
+      const target = BigInt(name);
+      if (target <= from || target - from > MAX_FALLTHROUGH_SPAN)
+        return err(
+          seedLineError(
+            number,
+            `a fallthrough target must lie 1..${MAX_FALLTHROUGH_SPAN} bytes after its instruction`,
+          ),
+        );
+      const key = `${from.toString(16)}:${kind}`;
+      if (seen.has(key))
+        return err(seedLineError(number, `duplicate ${kind} seed at ${address}`));
+      seen.add(key);
+      entries.push({ address: from, kind, target });
+      if (entries.length > MAX_GHIDRA_SEED_ENTRIES)
+        return err(
+          seedLineError(
+            number,
+            `more than ${MAX_GHIDRA_SEED_ENTRIES} seed entries`,
+          ),
+        );
+      continue;
+    }
     if (
       name !== undefined &&
       (name.length === 0 ||
@@ -128,7 +181,13 @@ const normalizedSeeds = (entries: readonly SeedEntry[]): string =>
   entries
     .map(
       (entry) =>
-        `0x${entry.address.toString(16)}\t${entry.kind}${entry.name === undefined ? "" : `\t${entry.name}`}\n`,
+        `0x${entry.address.toString(16)}\t${entry.kind}${
+          entry.target !== undefined
+            ? `\t0x${entry.target.toString(16)}`
+            : entry.name === undefined
+              ? ""
+              : `\t${entry.name}`
+        }\n`,
     )
     .join("");
 
@@ -206,7 +265,7 @@ export const resolveGhidraAnalysisSeeds = async (
   }
   if (!parsed.ok) return parsed;
   const normalized = normalizedSeeds(parsed.value);
-  const tally = { function: 0, code: 0, label: 0 };
+  const tally = { function: 0, code: 0, label: 0, fallthrough: 0 };
   for (const entry of parsed.value) tally[entry.kind] += 1;
   return ok({
     format: GHIDRA_SEED_FORMAT,
@@ -244,7 +303,8 @@ export const snapshotGhidraAnalysisSeeds = async (
 const totalEntries = (commitment: GhidraSeedCommitment): number =>
   commitment.entries.function +
   commitment.entries.code +
-  commitment.entries.label;
+  commitment.entries.label +
+  commitment.entries.fallthrough;
 
 /** Fail closed when the session did not apply exactly the committed seeds. */
 export const ghidraSeedFailure = (
@@ -277,10 +337,10 @@ export const ghidraSeedLimitations = (
   commitment === undefined
     ? []
     : [
-        `Ghidra analysis was seeded before auto-analysis from ${commitment.path} (sha256 ${commitment.sha256}: ${commitment.entries.function} function, ${commitment.entries.code} code, ${commitment.entries.label} label entries). Seeded functions, code and names are caller assertions, not Ghidra discoveries.`,
+        `Ghidra analysis was seeded before auto-analysis from ${commitment.path} (sha256 ${commitment.sha256}: ${commitment.entries.function} function, ${commitment.entries.code} code, ${commitment.entries.label} label, ${commitment.entries.fallthrough} fallthrough entries). Seeded functions, code, names and inline-operand fallthroughs are caller assertions, not Ghidra discoveries.`,
         ...(report === undefined
           ? []
           : [
-              `Seed outcome: ${report.function_created} functions created, ${report.function_existing} already present, ${report.function_failed} failed; ${report.code_decoded} code seeds decoded, ${report.code_failed} failed; ${report.label_applied} labels applied, ${report.label_failed} failed; ${report.unmapped} seeds outside initialized memory.`,
+              `Seed outcome: ${report.function_created} functions created, ${report.function_existing} already present, ${report.function_failed} failed; ${report.code_decoded} code seeds decoded, ${report.code_failed} failed; ${report.label_applied} labels applied, ${report.label_failed} failed; ${report.fallthrough_applied} fallthroughs applied, ${report.fallthrough_failed} failed; ${report.unmapped} seeds outside initialized memory.`,
             ]),
       ];

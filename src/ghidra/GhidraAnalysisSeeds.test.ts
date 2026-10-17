@@ -61,9 +61,40 @@ describe("Ghidra seed parsing", () => {
     ]);
   });
 
+  it("parses a fallthrough seed and canonicalizes its target", () => {
+    const parsed = parseGhidraSeeds("0x206BB2\tfallthrough\t0x206BB6\n");
+    if (!parsed.ok) throw parsed.error;
+    expect(parsed.value).toEqual([
+      { address: 0x206bb2n, kind: "fallthrough", target: 0x206bb6n },
+    ]);
+  });
+
   it.each([
     ["401000\tfunction", "line 1: address must be 0x-prefixed hex"],
-    ["0x401000\tdata", "line 1: kind must be function, code or label"],
+    [
+      "0x401000\tdata",
+      "line 1: kind must be function, code, label or fallthrough",
+    ],
+    [
+      "0x401000\tfallthrough",
+      "line 1: a fallthrough seed requires a 0x-prefixed hex target address",
+    ],
+    [
+      "0x401000\tfallthrough\tnext",
+      "line 1: a fallthrough seed requires a 0x-prefixed hex target address",
+    ],
+    [
+      "0x401000\tfallthrough\t0x401000",
+      "line 1: a fallthrough target must lie 1..64 bytes after its instruction",
+    ],
+    [
+      "0x401000\tfallthrough\t0x401041",
+      "line 1: a fallthrough target must lie 1..64 bytes after its instruction",
+    ],
+    [
+      "0x401000\tfallthrough\t0x401004\n0x401000\tfallthrough\t0x401006",
+      "line 2: duplicate fallthrough seed at 0x401000",
+    ],
     ["0x401000", "line 1: expected address<TAB>kind[<TAB>name]"],
     ["0x401000\tlabel", "line 1: a label seed requires a name"],
     [
@@ -154,7 +185,7 @@ describe("Ghidra seed session verification", () => {
     path: "/seeds.tsv",
     configured_path: "/seeds.tsv",
     sha256: "b".repeat(64),
-    entries: { function: 2, code: 1, label: 1 },
+    entries: { function: 2, code: 1, label: 1, fallthrough: 0 },
   };
   const report: GhidraSeedReport = {
     format: "rea-ghidra-seeds-v1",
@@ -167,6 +198,8 @@ describe("Ghidra seed session verification", () => {
     code_failed: 0,
     label_applied: 1,
     label_failed: 0,
+    fallthrough_applied: 0,
+    fallthrough_failed: 0,
     unmapped: 0,
   };
 
